@@ -330,19 +330,49 @@ class ConvModule(nn.Module):
         assert (kernel_size - 1) % 2 == 0, "kernel_size should be a odd number for 'SAME' padding"
         assert expansion_factor == 2, "Currently, Only Supports expansion_factor 2"
 
-        self.sequential = nn.Sequential(
-            Transpose(shape=(1, 2)),
-            PointwiseConv1d(in_channels, in_channels * expansion_factor, stride=1, padding=0, bias=True),
-            GLU(dim=1),
-            DepthwiseConv1d(in_channels, in_channels, kernel_size, stride=1, padding=(kernel_size - 1) // 2),
-            nn.BatchNorm1d(in_channels),
-            Swish(),
-            PointwiseConv1d(in_channels, in_channels, stride=1, padding=0, bias=True),
-            nn.Dropout(p=dropout_p),
-        )
+        self.pw_conv_1 = PointwiseConv1d(in_channels, in_channels * expansion_factor, stride=1, padding=0, bias=True)
+        self.act1 = GLU(dim=1)
+        self.dw_conv = DepthwiseConv1d(in_channels, in_channels, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+        self.bn = nn.BatchNorm1d(in_channels)
+        self.act2 = Swish()
+        self.pw_conv_2 = PointwiseConv1d(in_channels, in_channels, stride=1, padding=0, bias=True)
+        self.do = nn.Dropout(p=dropout_p)
 
-    def forward(self, inputs: Tensor) -> Tensor:
-        return self.sequential(inputs).transpose(1, 2)
+    # mask_pad = mask.bool().unsqueeze(1)
+    def forward(self, x, mask_pad):
+        """Compute convolution module.
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, channels).
+            mask_pad (torch.Tensor): used for batch padding (#batch, 1, time),
+                (0, 0, 0) means fake mask.
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, channels).
+        Reference for masking : https://github.com/Ascend/ModelZoo-PyTorch/blob/master/PyTorch/built-in/audio/Wenet_Conformer_for_Pytorch/wenet/transformer/convolution.py#L26
+        """
+        # mask batch padding
+        x = x.transpose(1, 2)
+        if mask_pad.size(2) > 0:  # time > 0
+            x = x.masked_fill(~mask_pad, 0.0)
+        x = self.pw_conv_1(x)
+        x = self.act1(x)
+        x = self.dw_conv(x)
+        # torch.Size([4, 128, 384])
+        x_bn = x.permute(0,2,1).reshape(-1, x.shape[1])
+        mask_bn = mask_pad.view(-1)
+        x_bn[mask_bn] = self.bn(x_bn[mask_bn])
+        x = x_bn.view(x.permute(0,2,1).shape).permute(0,2,1)
+        '''
+        x = self.bn(x)
+        '''
+        x = self.act2(x)
+        x = self.pw_conv_2(x)
+        x = self.do(x)
+        # mask batch padding
+        if mask_pad.size(2) > 0:  # time > 0
+            x = x.masked_fill(~mask_pad, 0.0)
+        x = x.transpose(1, 2)
+        return x
+
 
 
 class TimeReductionLayer(nn.Module):
@@ -540,9 +570,9 @@ class SqueezeformerEncoder(nn.Module):
         self.num_layers = num_layers
         self.recover_tensor = None
 
-        self.layers = nn.ModuleList()
+        self.blocks = nn.ModuleList()
         for idx in range(num_layers):
-            self.layers.append(
+            self.blocks.append(
                 SqueezeformerBlock(
                     encoder_dim=encoder_dim,
                     num_attention_heads=num_attention_heads,
@@ -579,10 +609,10 @@ class SqueezeformerEncoder(nn.Module):
         return x
 
 
-# def make_scale(encoder_dim):
-#     scale = torch.nn.Parameter(torch.tensor([1.] * encoder_dim)[None,None,:])
-#     bias = torch.nn.Parameter(torch.tensor([0.] * encoder_dim)[None,None,:])
-#     return scale, bias
+def make_scale(encoder_dim):
+    scale = torch.nn.Parameter(torch.tensor([1.] * encoder_dim)[None,None,:])
+    bias = torch.nn.Parameter(torch.tensor([0.] * encoder_dim)[None,None,:])
+    return scale, bias
 
 class SqueezeformerBlock(nn.Module):
     """
@@ -618,10 +648,10 @@ class SqueezeformerBlock(nn.Module):
     ):
         super(SqueezeformerBlock, self).__init__()
         
-        # self.scale_mhsa, self.bias_mhsa = make_scale(encoder_dim)
-        # self.scale_ff_mhsa, self.bias_ff_mhsa = make_scale(encoder_dim)
-        # self.scale_conv, self.bias_conv = make_scale(encoder_dim)
-        # self.scale_ff_conv, self.bias_ff_conv = make_scale(encoder_dim)
+        self.scale_mhsa, self.bias_mhsa = make_scale(encoder_dim)
+        self.scale_ff_mhsa, self.bias_ff_mhsa = make_scale(encoder_dim)
+        self.scale_conv, self.bias_conv = make_scale(encoder_dim)
+        self.scale_ff_conv, self.bias_ff_conv = make_scale(encoder_dim)
         
         self.mhsa = MultiHeadedSelfAttentionModule(
                     d_model=encoder_dim,
